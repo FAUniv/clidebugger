@@ -16,6 +16,10 @@
 --11/08/06 DCN Use io.write not print
 --30/08/06 DCN Allow access to array elements in 'dump'
 --10/10/06 DCN Default to breakfile for all commands that require a filename and give '-'
+--06/12/06 DCN Allow for punctuation characters in DUMP variable names
+--03/01/07 DCN Add pause on/off facility
+--19/06/07 DCN Allow for duff commands being typed in the debugger (thanks to Michael.Bringmann@lsi.com)
+--             Allow for case sensitive file systems               (thanks to Michael.Bringmann@lsi.com)
 
 --}}}
 --{{{  description
@@ -35,6 +39,8 @@
 
 --}}}
 
+local IsWindows = string.find(string.lower(os.getenv('OS') or ''),'^windows')
+
 local coro_debugger
 local events = { BREAK = 1, WATCH = 2, STEP = 3, SET = 4 }
 local breakpoints = {}
@@ -51,6 +57,7 @@ local trace_lines = false
 local ret_file, ret_line, ret_name
 local current_thread = 'main'
 local started = false
+local pause_off = false
 local _g      = _G
 local cocreate, cowrap = coroutine.create, coroutine.wrap
 local pausemsg = 'pause'
@@ -66,6 +73,21 @@ This can only be used in your code or from the console as a means to
 start/resume a debug session.
 If msg is given that is shown when the session starts/resumes. Useful to
 give a context if you've instrumented your code with pause() statements.
+]],
+
+poff =    [[
+poff                -- turn off pause() command|
+
+This causes all pause() commands to be ignored. This is useful if you have
+instrumented your code in a busy loop and want to continue normal execution
+with no further interruption.
+]],
+
+pon =     [[
+pon                 -- turn on pause() command|
+
+This re-instates honouring the pause() commands you may have instrumented
+your code with.
 ]],
 
 setb =    [[
@@ -588,7 +610,7 @@ local function capture_vars(ref,level,line)
   if string.find(file, "@") == 1 then
     file = string.sub(file, 2)
   end
-  file = string.lower(file)
+  if IsWindows then file = string.lower(file) end
 
   if not line then
     line = getinfo(lvl, "currentline")
@@ -1083,7 +1105,7 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
         depth = tonumber(depth or 1)
         local v = eval_env
         local n = nil
-        for w in string.gmatch(name,"[%w_]+") do
+        for w in string.gmatch(name,"[^%.]+") do     --get everything between dots
           if tonumber(w) then
             v = v[tonumber(w)]
           else
@@ -1111,6 +1133,16 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
         io.write('Nothing to show\n')
       end
       
+      --}}}
+
+    elseif command == "poff" then
+      --{{{  turn pause command off
+      pause_off = true
+      --}}}
+
+    elseif command == "pon" then
+      --{{{  turn pause command on
+      pause_off = false
       --}}}
 
     elseif command == "tron" then
@@ -1164,7 +1196,9 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
       if string.sub(line,1,1) == '=' then line = string.gsub(line,'=','return ',1) end
       
       local ok, func = pcall(loadstring,line)
-      if not ok then
+      if func == nil then                             --Michael.Bringmann@lsi.com
+        io.write("Compile error: "..line..'\n')
+      elseif not ok then
         io.write("Compile error: "..func..'\n')
       else
         setfenv(func, eval_env)
@@ -1253,6 +1287,7 @@ end
 --
 
 function pause(x)
+  if pause_off then return end               --being told to ignore pauses
   pausemsg = x or 'pause'
   local lines
   local src = getinfo(2,'short_src')
