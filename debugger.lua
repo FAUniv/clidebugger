@@ -20,6 +20,16 @@
 --03/01/07 DCN Add pause on/off facility
 --19/06/07 DCN Allow for duff commands being typed in the debugger (thanks to Michael.Bringmann@lsi.com)
 --             Allow for case sensitive file systems               (thanks to Michael.Bringmann@lsi.com)
+--04/08/09 DCN Add optional line count param to pause
+--05/08/09 DCN Reset the debug hook in Pause() even if we think we're started
+--30/09/09 DCN Re-jig to not use co-routines (makes debugging co-routines awkward)
+--01/10/09 DCN Add ability to break on reaching any line in a file
+--24/07/13 TWW Added code for emulating setfenv/getfenv in Lua 5.2 as per
+--             http://lua-users.org/lists/lua-l/2010-06/msg00313.html
+--25/07/13 TWW Copied Alex Parrill's fix for errors when tracing back across a C frame
+--             (https://github.com/ColonelThirtyTwo/clidebugger, 26/01/12)
+--25/07/13 DCN Allow for windows and unix file name conventions in has_breakpoint
+--26/07/13 DCN Allow for \ being interpreted as an escape inside a [] pattern in 5.2
 
 --}}}
 --{{{  description
@@ -62,17 +72,69 @@ local _g      = _G
 local cocreate, cowrap = coroutine.create, coroutine.wrap
 local pausemsg = 'pause'
 
+--{{{  make Lua 5.2 compatible
+
+if not setfenv then -- Lua 5.2
+  --[[
+  As far as I can see, the only missing detail of these functions (except
+  for occasional bugs) to achieve 100% compatibility is the case of
+  'getfenv' over a function that does not have an _ENV variable (that is,
+  it uses no globals).
+
+  We could use a weak table to keep the environments of these functions
+  when set by setfenv, but that still misses the case of a function
+  without _ENV that was not subjected to setfenv.
+
+  -- Roberto
+  ]]--
+
+  setfenv = setfenv or function(f, t)
+    f = (type(f) == 'function' and f or debug.getinfo(f + 1, 'f').func)
+    local name
+    local up = 0
+    repeat
+      up = up + 1
+      name = debug.getupvalue(f, up)
+    until name == '_ENV' or name == nil
+    if name then
+      debug.upvaluejoin(f, up, function() return name end, 1) -- use unique upvalue
+      debug.setupvalue(f, up, t)
+    end
+  end
+
+  getfenv = getfenv or function(f)
+    f = (type(f) == 'function' and f or debug.getinfo(f + 1, 'f').func)
+    local name, val
+    local up = 0
+    repeat
+      up = up + 1
+      name, val = debug.getupvalue(f, up)
+    until name == '_ENV' or name == nil
+    return val
+  end
+
+end
+
+--}}}
+
 --{{{  local hints -- command help
 --The format in here is name=summary|description
 local hints = {
 
 pause =   [[
-pause(msg)          -- start/resume a debugger session|
+pause(msg[,lines][,force]) -- start/resume a debugger session|
 
 This can only be used in your code or from the console as a means to
 start/resume a debug session.
 If msg is given that is shown when the session starts/resumes. Useful to
 give a context if you've instrumented your code with pause() statements.
+
+If lines is given, the script pauses after that many lines, else it pauses
+immediately.
+
+If force is true, the pause function is honoured even if poff has been used.
+This is useful when in an interactive console session to regain debugger
+control.
 ]],
 
 poff =    [[
@@ -91,7 +153,7 @@ your code with.
 ]],
 
 setb =    [[
-setb [line file]    -- set a breakpoint to line/file|
+setb [line file]    -- set a breakpoint to line/file|, line 0 means 'any'
 
 If file is omitted or is "-" the breakpoint is set at the file for the
 currently set level (see "set"). Execution pauses when this line is about
@@ -99,7 +161,10 @@ to be executed and the debugger session is re-activated.
 
 The file can be given as the fully qualified name, partially qualified or
 just the file name. E.g. if file is set as "myfile.lua", then whenever
-execution reaches any file that ends with "myfile.lua" it will pause.
+execution reaches any file that ends with "myfile.lua" it will pause. If
+no extension is given, any extension will do.
+
+If the line is given as 0, then reaching any line in the file will do.
 ]],
 
 delb =    [[
@@ -155,10 +220,11 @@ If you are inside a function, using "out 1" will run until you return
 from that function to the caller.
 ]],
 
-goto    = [[
-goto <line>         -- step to line number <line> in the current file|
+gotoo   = [[
+gotoo [line file]    -- step to line in file|
 
-The line and current file are those in the currently set context level.
+This is equivalent to 'setb line file', followed by 'run', followed
+by 'delb line file'.
 ]],
 
 listb   = [[
@@ -460,17 +526,19 @@ local function tracestack(l)
   traceinfo.pausemsg = pausemsg
   for ar,i in gi(l) do
     table.insert( traceinfo, ar )
-    local names  = {}
-    local values = {}
-    for n,v in gl(i,0) do
-      if string.sub(n,1,1) ~= '(' then   --ignore internal control variables
-        table.insert( names, n )
-        table.insert( values, v )
+    if ar.what ~= 'C' then
+      local names  = {}
+      local values = {}
+      for n,v in gl(i,0) do
+        if string.sub(n,1,1) ~= '(' then   --ignore internal control variables
+          table.insert( names, n )
+          table.insert( values, v )
+        end
       end
-    end
-    if #names > 0 then
-      ar.lnames  = names
-      ar.lvalues = values
+      if #names > 0 then
+        ar.lnames  = names
+        ar.lvalues = values
+      end
     end
     if ar.func then
       local names  = {}
@@ -511,13 +579,17 @@ local function info() dumpvar( traceinfo, 0, 'traceinfo' ) end
 
 --}}}
 
---{{{  local function set_breakpoint(file, line)
+--{{{  local function set_breakpoint(file, line, once)
 
-local function set_breakpoint(file, line)
+local function set_breakpoint(file, line, once)
   if not breakpoints[line] then
     breakpoints[line] = {}
   end
-  breakpoints[line][file] = true
+  if once then
+    breakpoints[line][file] = 1
+  else
+    breakpoints[line][file] = true
+  end
 end
 
 --}}}
@@ -535,18 +607,46 @@ end
 --allow for 'sloppy' file names
 --search for file and all variations walking up its directory hierachy
 --ditto for the file with no extension
+--a breakpoint can be permenant or once only, if once only its removed
+--after detection here, these are used for temporary breakpoints in the
+--debugger loop when executing the 'gotoo' command
+--a breakpoint on line 0 of a file means any line in that file
 
 local function has_breakpoint(file, line)
-  if not breakpoints[line] then return false end
+  local isLine = breakpoints[line]
+  local isZero = breakpoints[0]
+  if not isLine and not isZero then return false end
   local noext = string.gsub(file,"(%..-)$",'',1)
   if noext == file then noext = nil end
   while file do
-    if breakpoints[line][file] then return true end
-    file = string.match(file,"[:/\](.+)$")
+    if isLine and isLine[file] then
+      if isLine[file] == 1 then isLine[file] = nil end
+      return true
+    end
+    if isZero and isZero[file] then
+      if isZero[file] == 1 then isZero[file] = nil end
+      return true
+    end
+    if IsWindows then
+      file = string.match(file,"[:/\\](.+)$")
+    else
+      file = string.match(file,"[:/](.+)$")
+    end
   end
   while noext do
-    if breakpoints[line][noext] then return true end
-    noext = string.match(noext,"[:/\](.+)$")
+    if isLine and isLine[noext] then
+      if isLine[noext] == 1 then isLine[noext] = nil end
+      return true
+    end
+    if isZero and isZero[noext] then
+      if isZero[noext] == 1 then isZero[noext] = nil end
+      return true
+    end
+    if IsWindows then
+      noext = string.match(noext,"[:/\\](.+)$")
+    else
+      noext = string.match(noext,"[:/](.+)$")
+    end
   end
   return false
 end
@@ -725,73 +825,6 @@ local function trace_event(event, line, level)
 end
 
 --}}}
---{{{  local function debug_hook(event, line, level, thread)
-
-local function debug_hook(event, line, level, thread)
-  if not started then debug.sethook() return end
-  current_thread = thread or 'main'
-  local level = level or 2
-  trace_event(event,line,level)
-  if event == "call" then
-    stack_level[current_thread] = stack_level[current_thread] + 1
-  elseif event == "return" then
-    stack_level[current_thread] = stack_level[current_thread] - 1
-    if stack_level[current_thread] < 0 then stack_level[current_thread] = 0 end
-  else
-    local vars,file,line = capture_vars(level,1,line)
-    local stop, ev, idx = false, events.STEP, 0
-    while true do
-      for index, value in pairs(watches) do
-        setfenv(value.func, vars)
-        local status, res = pcall(value.func)
-        if status and res then
-          ev, idx = events.WATCH, index
-          stop = true
-          break
-        end
-      end
-      if stop then break end
-      if (step_into)
-      or (step_over and (stack_level[current_thread] <= step_level[current_thread] or stack_level[current_thread] == 0)) then
-        step_lines = step_lines - 1
-        if step_lines < 1 then
-          ev, idx = events.STEP, 0
-          break
-        end
-      end
-      if has_breakpoint(file, line) then
-        ev, idx = events.BREAK, 0
-        break
-      end
-      return
-    end
-    tracestack(level)
-    local last_next = 1
-    local err, next = assert(coroutine.resume(coro_debugger, ev, vars, file, line, idx))
-    while true do
-      if next == 'cont' then
-        return
-      elseif next == 'stop' then
-        started = false
-        debug.sethook()
-        return
-      elseif tonumber(next) then --get vars for given level or last level
-        next = tonumber(next)
-        if next == 0 then next = last_next end
-        last_next = next
-        restore_vars(level,vars)
-        vars, file, line = capture_vars(level,next)
-        err, next = assert(coroutine.resume(coro_debugger, events.SET, vars, file, line, idx))
-      else
-        io.write('Unknown command from debugger_loop: '..tostring(next)..'\n')
-        io.write('Stopping debugger\n')
-        next = 'stop'
-      end
-    end
-  end
-end
-
---}}}
 --{{{  local function report(ev, vars, file, line, idx_watch)
 
 local function report(ev, vars, file, line, idx_watch)
@@ -820,13 +853,13 @@ end
 
 --}}}
 
---{{{  local function debugger_loop(server)
+--{{{  local function debugger_loop(ev, vars, file, line, idx_watch)
 
 local function debugger_loop(ev, vars, file, line, idx_watch)
 
-  io.write("Lua Debugger\n")
-  local eval_env, breakfile, breakline = report(ev, vars, file, line, idx_watch)
-  io.write("Type 'help' for commands\n")
+  local eval_env  = vars or {}
+  local breakfile = file or '?'
+  local breakline = line or 0
 
   local command, args
 
@@ -973,7 +1006,7 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
       --{{{  run until breakpoint
       step_into = false
       step_over = false
-      eval_env, breakfile, breakline = report(coroutine.yield('cont'))
+      return 'cont'
       --}}}
 
     elseif command == "step" then
@@ -982,7 +1015,7 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
       step_over  = false
       step_into  = true
       step_lines = tonumber(N or 1)
-      eval_env, breakfile, breakline = report(coroutine.yield('cont'))
+      return 'cont'
       --}}}
 
     elseif command == "over" then
@@ -992,7 +1025,7 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
       step_over  = true
       step_lines = tonumber(N or 1)
       step_level[current_thread] = stack_level[current_thread]
-      eval_env, breakfile, breakline = report(coroutine.yield('cont'))
+      return 'cont'
       --}}}
 
     elseif command == "out" then
@@ -1002,22 +1035,20 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
       step_over  = true
       step_lines = 1
       step_level[current_thread] = stack_level[current_thread] - tonumber(N or 1)
-      eval_env, breakfile, breakline = report(coroutine.yield('cont'))
+      return 'cont'
       --}}}
 
-    elseif command == "goto" then
+    elseif command == "gotoo" then
       --{{{  step until reach line
-      local N = tonumber(args)
-      if N then
+      local line, filename = getargs('LF')
+      if line ~= '' then
         step_over  = false
         step_into  = false
-        if has_breakpoint(breakfile,N) then
-          eval_env, breakfile, breakline = report(coroutine.yield('cont'))
+        if has_breakpoint(filename,line) then
+          return 'cont'
         else
-          local bf = breakfile
-          set_breakpoint(breakfile,N)
-          eval_env, breakfile, breakline = report(coroutine.yield('cont'))
-          if breakfile == bf and breakline == N then remove_breakpoint(breakfile,N) end
+          set_breakpoint(filename,line,true)
+          return 'cont'
         end
       else
         io.write("Bad request\n")
@@ -1028,14 +1059,7 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
       --{{{  set/show context level
       local level = args
       if level and level == '' then level = nil end
-      if level then
-        eval_env, breakfile, breakline = report(coroutine.yield(level))
-      end
-      if eval_env.__VARSLEVEL__ then
-        io.write('Level: '..eval_env.__VARSLEVEL__..'\n')
-      else
-        io.write('No level set\n')
-      end
+      if level then return level end
       --}}}
 
     elseif command == "vars" then
@@ -1213,7 +1237,7 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
             io.write('\n')
           end
           --update in the context
-          eval_env, breakfile, breakline = report(coroutine.yield(0))
+          return 0
         else
           io.write("Run error: "..res[2]..'\n')
         end
@@ -1223,6 +1247,93 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
     end
   end
 
+end
+
+--}}}
+--{{{  local function debug_hook(event, line, level, thread)
+
+local function debug_hook(event, line, level, thread)
+  if not started then debug.sethook(); coro_debugger = nil; return end
+  current_thread = thread or 'main'
+  local level = level or 2
+  trace_event(event,line,level)
+  if event == "call" then
+    stack_level[current_thread] = stack_level[current_thread] + 1
+  elseif event == "return" then
+    stack_level[current_thread] = stack_level[current_thread] - 1
+    if stack_level[current_thread] < 0 then stack_level[current_thread] = 0 end
+  else
+    local vars,file,line = capture_vars(level,1,line)
+    local stop, ev, idx = false, events.STEP, 0
+    while true do
+      for index, value in pairs(watches) do
+        setfenv(value.func, vars)
+        local status, res = pcall(value.func)
+        if status and res then
+          ev, idx = events.WATCH, index
+          stop = true
+          break
+        end
+      end
+      if stop then break end
+      if (step_into)
+      or (step_over and (stack_level[current_thread] <= step_level[current_thread] or stack_level[current_thread] == 0)) then
+        step_lines = step_lines - 1
+        if step_lines < 1 then
+          ev, idx = events.STEP, 0
+          break
+        end
+      end
+      if has_breakpoint(file, line) then
+        ev, idx = events.BREAK, 0
+        break
+      end
+      return
+    end
+    if not coro_debugger then
+      io.write("Lua Debugger\n")
+      vars, file, line = report(ev, vars, file, line, idx)
+      io.write("Type 'help' for commands\n")
+      coro_debugger = true
+    else
+      vars, file, line = report(ev, vars, file, line, idx)
+    end
+    tracestack(level)
+    local last_next = 1
+    local next = 'ask'
+    local silent = false
+    while true do
+      if next == 'ask' then
+        next = debugger_loop(ev, vars, file, line, idx)
+      elseif next == 'cont' then
+        return
+      elseif next == 'stop' then
+        started = false
+        debug.sethook()
+        coro_debugger = nil
+        return
+      elseif tonumber(next) then --get vars for given level or last level
+        next = tonumber(next)
+        if next == 0 then silent = true; next = last_next else silent = false end
+        last_next = next
+        restore_vars(level,vars)
+        vars, file, line = capture_vars(level,next)
+        if not silent then
+          if vars and vars.__VARSLEVEL__ then
+            io.write('Level: '..vars.__VARSLEVEL__..'\n')
+          else
+            io.write('No level set\n')
+          end
+        end
+        ev = events.SET
+        next = 'ask'
+      else
+        io.write('Unknown command from debugger_loop: '..tostring(next)..'\n')
+        io.write('Stopping debugger\n')
+        next = 'stop'
+      end
+    end
+  end
 end
 
 --}}}
@@ -1280,18 +1391,20 @@ end
 
 --}}}
 
---{{{  function pause()
+--{{{  function pause(x,l,f)
 
 --
 -- Starts/resumes a debug session
 --
 
-function pause(x)
-  if pause_off then return end               --being told to ignore pauses
+function pause(x,l,f)
+  if not f and pause_off then return end       --being told to ignore pauses
   pausemsg = x or 'pause'
   local lines
   local src = getinfo(2,'short_src')
-  if src == "stdin" then
+  if l then
+    lines = l   --being told when to stop
+  elseif src == "stdin" then
     lines = 1   --if in a console session, stop now
   else
     lines = 2   --if in a script, stop when get out of pause()
@@ -1300,8 +1413,8 @@ function pause(x)
     --we'll stop now 'cos the existing debug hook will grab us
     step_lines = lines
     step_into  = true
+    debug.sethook(debug_hook, "crl")         --reset it in case some external agent fiddled with it
   else
-    coro_debugger = cocreate(debugger_loop)  --NB: Use original coroutune.create
     --set to stop when get out of pause()
     trace_level[current_thread] = 0
     step_level [current_thread] = 0
@@ -1314,7 +1427,7 @@ function pause(x)
 end
 
 --}}}
---{{{  function dump()
+--{{{  function dump(v,depth)
 
 --shows the value of the given variable, only really useful
 --when the variable is a table
