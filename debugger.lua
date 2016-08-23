@@ -1220,6 +1220,9 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
       if string.sub(line,1,1) == '=' then line = string.gsub(line,'=','return ',1) end
       
       local ok, func = pcall(loadstring,line)
+      if ok and func==nil then -- auto-print variables
+          ok, func = pcall(loadstring,'print(' .. line .. ')')
+      end
       if func == nil then                             --Michael.Bringmann@lsi.com
         io.write("Compile error: "..line..'\n')
       elseif not ok then
