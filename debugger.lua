@@ -30,6 +30,7 @@
 --             (https://github.com/ColonelThirtyTwo/clidebugger, 26/01/12)
 --25/07/13 DCN Allow for windows and unix file name conventions in has_breakpoint
 --26/07/13 DCN Allow for \ being interpreted as an escape inside a [] pattern in 5.2
+--29/01/17 RMM Fix lua 5.2 and 5.3 compat, fix crash in error msg, sort help output
 
 --}}}
 --{{{  description
@@ -74,6 +75,8 @@ local pausemsg = 'pause'
 
 --{{{  make Lua 5.2 compatible
 
+local unpack = unpack or table.unpack
+local loadstring = loadstring or load
 if not setfenv then -- Lua 5.2
   --[[
   As far as I can see, the only missing detail of these functions (except
@@ -221,7 +224,7 @@ from that function to the caller.
 ]],
 
 gotoo   = [[
-gotoo [line file]    -- step to line in file|
+gotoo [line file]   -- step to line in file|
 
 This is equivalent to 'setb line file', followed by 'run', followed
 by 'delb line file'.
@@ -1106,15 +1109,17 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
           if n then n = n..'.'..w else n = w end
           if not v then break end
         end
-        if type(v) == 'function' then
+        if type(n) ~= 'string' then
+            io.write("Invalid function name given\n")
+        elseif type(v) == 'function' then
           local def = debug.getinfo(v,'S')
           if def then
             io.write(def.what..' in '..def.short_src..' '..def.linedefined..'..'..def.lastlinedefined..'\n')
           else
-            io.write('Cannot get info for '..v..'\n')
+            io.write('Cannot get info for '..n..'\n')
           end
         else
-          io.write(v..' is not a function\n')
+          io.write(n..' is not a function\n')
         end
       else
         io.write("Bad request\n")
@@ -1201,10 +1206,13 @@ local function debugger_loop(ev, vars, file, line, idx_watch)
       if command ~= '' and hints[command] then
         io.write(hints[command]..'\n')
       else
-        for _,v in pairs(hints) do
+        local l = {}
+        for k,v in pairs(hints) do
           local _,_,h = string.find(v,"(.+)|")
-          io.write(h..'\n')
+          l[#l+1] = h..'\n'
         end
+        table.sort(l)
+        io.write(table.concat(l))
       end
       --}}}
 
